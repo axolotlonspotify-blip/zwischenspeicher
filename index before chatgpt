@@ -1,0 +1,1240 @@
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason
+} = require('@whiskeysockets/baileys');
+
+const qrcode = require('qrcode-terminal');
+const fs = require('fs');
+const path = require('path');
+const pino = require('pino');
+const readline = require('readline');
+
+
+// =========================
+// SESSION-LOGS AUSBLENDEN
+// =========================
+
+const originalConsoleLog = console.log;
+const originalConsoleError = console.error;
+const originalConsoleWarn = console.warn;
+
+function shouldHideSessionLog(args) {
+
+    const text = args
+        .map(arg => {
+
+            if (typeof arg === 'string') {
+                return arg;
+            }
+
+            try {
+                return JSON.stringify(arg);
+            } catch {
+                return String(arg);
+            }
+        })
+        .join(' ');
+
+    return (
+        text.includes('Closing session: SessionEntry') ||
+        text.includes(
+            'Closing stale open session for new outgoing prekey bundle'
+        ) ||
+        text.includes(
+            'Closing open session in favor of incoming prekey bundle'
+        ) ||
+        text.includes(
+            'Removing old closed session'
+        ) ||
+        text.includes(
+            'Decrypted message with closed session'
+        )
+    );
+}
+
+
+// =========================
+// CONSOLE FILTER
+// =========================
+
+console.log = (...args) => {
+
+    if (shouldHideSessionLog(args)) {
+        return;
+    }
+
+    originalConsoleLog(...args);
+};
+
+console.error = (...args) => {
+
+    if (shouldHideSessionLog(args)) {
+        return;
+    }
+
+    originalConsoleError(...args);
+};
+
+console.warn = (...args) => {
+
+    if (shouldHideSessionLog(args)) {
+        return;
+    }
+
+    originalConsoleWarn(...args);
+};
+
+
+// =========================
+// DIREKTEN STDOUT/STDERR
+// FILTERN
+// =========================
+
+const originalStdoutWrite =
+    process.stdout.write.bind(
+        process.stdout
+    );
+
+const originalStderrWrite =
+    process.stderr.write.bind(
+        process.stderr
+    );
+
+function shouldHideRawSessionLog(chunk) {
+
+    if (
+        typeof chunk !== 'string' &&
+        !Buffer.isBuffer(chunk)
+    ) {
+        return false;
+    }
+
+    const text =
+        Buffer.isBuffer(chunk)
+            ? chunk.toString()
+            : chunk;
+
+    return (
+        text.includes(
+            'Closing session: SessionEntry'
+        ) ||
+        text.includes(
+            'Closing stale open session for new outgoing prekey bundle'
+        ) ||
+        text.includes(
+            'Closing open session in favor of incoming prekey bundle'
+        ) ||
+        text.includes(
+            'Removing old closed session'
+        ) ||
+        text.includes(
+            'Decrypted message with closed session'
+        )
+    );
+}
+
+process.stdout.write = function (
+    chunk,
+    encoding,
+    callback
+) {
+
+    if (
+        shouldHideRawSessionLog(
+            chunk
+        )
+    ) {
+
+        if (
+            typeof callback ===
+            'function'
+        ) {
+            callback();
+        }
+
+        return true;
+    }
+
+    return originalStdoutWrite(
+        chunk,
+        encoding,
+        callback
+    );
+};
+
+process.stderr.write = function (
+    chunk,
+    encoding,
+    callback
+) {
+
+    if (
+        shouldHideRawSessionLog(
+            chunk
+        )
+    ) {
+
+        if (
+            typeof callback ===
+            'function'
+        ) {
+            callback();
+        }
+
+        return true;
+    }
+
+    return originalStderrWrite(
+        chunk,
+        encoding,
+        callback
+    );
+};
+
+
+// =========================
+// DATEIEN LADEN
+// =========================
+
+function loadRanks() {
+
+    try {
+
+        return JSON.parse(
+            fs.readFileSync(
+                './ranks.json',
+                'utf8'
+            )
+        );
+
+    } catch {
+
+        return {};
+    }
+}
+
+function saveRanks(ranks) {
+
+    fs.writeFileSync(
+        './ranks.json',
+        JSON.stringify(
+            ranks,
+            null,
+            2
+        ),
+        'utf8'
+    );
+}
+
+function loadPrefix() {
+
+    try {
+
+        const data = JSON.parse(
+            fs.readFileSync(
+                './prefix.json',
+                'utf8'
+            )
+        );
+
+        if (
+            typeof data.prefix === 'string' &&
+            data.prefix.length > 0
+        ) {
+            return data.prefix;
+        }
+
+        return '!';
+
+    } catch {
+
+        return '!';
+    }
+}
+
+function loadGroupPrefixes() {
+
+    try {
+
+        return JSON.parse(
+            fs.readFileSync(
+                './groupPrefixes.json',
+                'utf8'
+            )
+        );
+
+    } catch {
+
+        return {};
+    }
+}
+
+function loadMaintenance() {
+
+    try {
+
+        return JSON.parse(
+            fs.readFileSync(
+                './maintenance.json',
+                'utf8'
+            )
+        );
+
+    } catch {
+
+        return {};
+    }
+}
+
+function loadKilledGroups() {
+
+    try {
+
+        return JSON.parse(
+            fs.readFileSync(
+                './killedGroups.json',
+                'utf8'
+            )
+        );
+
+    } catch {
+
+        return {};
+    }
+}
+
+function loadOnlyOwner() {
+
+    try {
+
+        return JSON.parse(
+            fs.readFileSync(
+                './onlyOwner.json',
+                'utf8'
+            )
+        );
+
+    } catch {
+
+        return {};
+    }
+}
+
+
+// =========================
+// LID NORMALISIEREN
+// =========================
+
+function normalizeLid(lid) {
+
+    if (!lid) {
+        return null;
+    }
+
+    return (
+        lid
+            .split(':')[0]
+            .split('@')[0] +
+        '@lid'
+    );
+}
+
+
+// =========================
+// TELEFONNUMMER ERMITTELN
+// =========================
+
+async function getPhoneNumber(
+    sock,
+    message,
+    senderLid
+) {
+
+    try {
+
+        const directPhone =
+            message.key.participantPn ||
+            message.key.senderPn;
+
+        if (
+            directPhone &&
+            directPhone.includes(
+                '@s.whatsapp.net'
+            )
+        ) {
+
+            return directPhone
+                .split(':')[0]
+                .split('@')[0];
+        }
+
+        if (
+            senderLid &&
+            senderLid.endsWith('@lid') &&
+            sock.signalRepository?.lidMapping
+        ) {
+
+            const pn =
+                await sock.signalRepository
+                    .lidMapping
+                    .getPNForLID(
+                        senderLid
+                    );
+
+            if (pn) {
+
+                return pn
+                    .split(':')[0]
+                    .split('@')[0];
+            }
+        }
+
+    } catch (error) {
+
+        console.error(
+            '❌ Fehler beim Ermitteln der Telefonnummer:',
+            error
+        );
+    }
+
+    return 'unbekannt';
+}
+
+
+// =========================
+// REACTION
+// =========================
+
+async function react(
+    sock,
+    message,
+    emoji
+) {
+
+    try {
+
+        await sock.sendMessage(
+            message.key.remoteJid,
+            {
+                react: {
+                    text: emoji,
+                    key: message.key
+                }
+            }
+        );
+
+    } catch (error) {
+
+        console.error(
+            '❌ Reaction Fehler:',
+            error
+        );
+    }
+}
+
+
+// =========================
+// RESTART-REACTION
+// =========================
+
+async function finishRestartReaction(
+    sock
+) {
+
+    const restartFile =
+        path.join(
+            __dirname,
+            'restartReaction.json'
+        );
+
+    if (!fs.existsSync(restartFile)) {
+        return;
+    }
+
+    try {
+
+        const messageKey =
+            JSON.parse(
+                fs.readFileSync(
+                    restartFile,
+                    'utf8'
+                )
+            );
+
+        await sock.sendMessage(
+            messageKey.remoteJid,
+            {
+                react: {
+                    text: '✅',
+                    key: messageKey
+                }
+            }
+        );
+
+        fs.unlinkSync(restartFile);
+
+        console.log(
+            '✅ Neustart erfolgreich abgeschlossen.'
+        );
+
+    } catch (error) {
+
+        console.error(
+            '❌ Fehler beim Aktualisieren der Restart-Reaction:',
+            error
+        );
+    }
+}
+
+
+// =========================
+// COMMANDS LADEN
+// =========================
+
+const commands = {};
+
+const commandsPath =
+    path.join(
+        __dirname,
+        'commands'
+    );
+
+const commandFiles =
+    fs
+        .readdirSync(
+            commandsPath
+        )
+        .filter(
+            file =>
+                file.endsWith('.js')
+        );
+
+for (
+    const file of commandFiles
+) {
+
+    try {
+
+        const command =
+            require(
+                path.join(
+                    commandsPath,
+                    file
+                )
+            );
+
+        if (
+            !command.name ||
+            !command.execute
+        ) {
+
+            console.log(
+                `⚠️ Command übersprungen: ${file}`
+            );
+
+            continue;
+        }
+
+        commands[
+            command.name
+        ] = command;
+
+        if (
+            Array.isArray(
+                command.aliases
+            )
+        ) {
+
+            for (
+                const alias of
+                command.aliases
+            ) {
+
+                commands[
+                    alias
+                ] = command;
+            }
+        }
+
+        console.log(
+            `✅ Command geladen: ${command.name}`
+        );
+
+    } catch (error) {
+
+        console.error(
+            `❌ Fehler beim Laden von ${file}:`,
+            error
+        );
+    }
+}
+
+global.commands =
+    commands;
+
+
+// =========================
+// TERMINAL-COMMANDS
+// =========================
+
+let terminalInputStarted = false;
+
+function startTerminalCommands(
+    sock
+) {
+
+    if (terminalInputStarted) {
+        return;
+    }
+
+    terminalInputStarted = true;
+
+    const terminal =
+        readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
+
+    console.log(
+        '💻 Terminal-Commands aktiviert: !ping | !restart'
+    );
+
+    terminal.on(
+        'line',
+        async input => {
+
+            const text =
+                input.trim();
+
+            if (!text) {
+                return;
+            }
+
+            if (
+                text !== '!ping' &&
+                text !== '!restart'
+            ) {
+                return;
+            }
+
+            const commandName =
+                text
+                    .slice(1)
+                    .trim()
+                    .split(/\s+/)[0]
+                    .toLowerCase();
+
+            const command =
+                commands[commandName];
+
+            if (!command) {
+                return;
+            }
+
+            console.log(
+                `💻 Terminal Command: ${text}`
+            );
+
+            const ownJid =
+                sock.user?.id;
+
+            if (!ownJid) {
+
+                console.error(
+                    '❌ Terminal Command nicht möglich: WhatsApp-ID nicht verfügbar.'
+                );
+
+                return;
+            }
+
+            const terminalMessage = {
+
+                key: {
+                    remoteJid: ownJid,
+                    fromMe: true,
+                    id: `TERMINAL-${Date.now()}`,
+                    participant: ownJid
+                },
+
+                message: {
+                    conversation: text
+                }
+            };
+
+            try {
+
+                await command.execute({
+
+                    sock,
+
+                    message:
+                        terminalMessage,
+
+                    text:
+                        text.slice(1).trim(),
+
+                    senderRank: 3,
+
+                    ranks:
+                        loadRanks(),
+
+                    saveRanks,
+
+                    react
+                });
+
+            } catch (error) {
+
+                console.error(
+                    `❌ Fehler beim Terminal Command ${command.name}:`,
+                    error
+                );
+
+                await react(
+                    sock,
+                    terminalMessage,
+                    '❌'
+                );
+            }
+        }
+    );
+}
+
+
+// =========================
+// WHATSAPP
+// =========================
+
+async function startBot() {
+
+    const {
+        state,
+        saveCreds
+    } =
+        await useMultiFileAuthState(
+            './auth'
+        );
+
+    const sock =
+        makeWASocket({
+
+            auth: state,
+
+            logger: pino({
+                level: 'silent'
+            })
+        });
+
+
+    sock.ev.on(
+        'creds.update',
+        saveCreds
+    );
+
+
+    // =========================
+    // VERBINDUNG
+    // =========================
+
+    sock.ev.on(
+        'connection.update',
+        update => {
+
+            const {
+                connection,
+                lastDisconnect,
+                qr
+            } = update;
+
+
+            if (qr) {
+
+                console.log(
+                    '📱 QR-Code scannen:'
+                );
+
+                qrcode.generate(
+                    qr,
+                    {
+                        small: true
+                    }
+                );
+            }
+
+
+            if (
+                connection === 'open'
+            ) {
+
+                console.log(
+                    '✅ WhatsApp verbunden!'
+                );
+
+                console.log(
+                    '🤖 Bot gestartet – v1.23'
+                );
+
+                finishRestartReaction(
+                    sock
+                );
+
+                startTerminalCommands(
+                    sock
+                );
+            }
+
+
+            if (
+                connection === 'close'
+            ) {
+
+                const shouldReconnect =
+                    lastDisconnect
+                        ?.error
+                        ?.output
+                        ?.statusCode !==
+                    DisconnectReason.loggedOut;
+
+
+                console.log(
+                    '❌ Verbindung geschlossen.'
+                );
+
+
+                if (
+                    shouldReconnect
+                ) {
+
+                    console.log(
+                        '🔄 Verbindung wird neu aufgebaut...'
+                    );
+
+                    startBot();
+                }
+            }
+        }
+    );
+
+
+    // =========================
+    // NACHRICHTEN
+    // =========================
+
+    sock.ev.on(
+        'messages.upsert',
+        async ({
+            messages
+        }) => {
+
+            const message =
+                messages[0];
+
+            if (!message) {
+                return;
+            }
+
+
+            const remoteJid =
+                message.key.remoteJid;
+
+            if (!remoteJid) {
+                return;
+            }
+
+
+            // =========================
+            // TEXT HOLEN
+            // =========================
+
+            const text =
+                message.message
+                    ?.conversation ||
+                message.message
+                    ?.extendedTextMessage
+                    ?.text ||
+                '';
+
+            if (!text) {
+                return;
+            }
+
+
+            // =========================
+            // RÄNGE
+            // =========================
+
+            const ranks =
+                loadRanks();
+
+
+            const rawSenderLid =
+                message.key.participant ||
+                message.key.remoteJid;
+
+
+            const senderLid =
+                normalizeLid(
+                    rawSenderLid
+                );
+
+
+            const senderRank =
+                Number(
+                    ranks[senderLid] ??
+                    ranks[rawSenderLid] ??
+                    0
+                );
+
+
+            const isGroup =
+                remoteJid.endsWith(
+                    '@g.us'
+                );
+
+
+            // =========================
+            // PRIVATE NACHRICHTEN
+            // NUR RANG 3+
+            // =========================
+
+            if (
+                !isGroup &&
+                senderRank < 3
+            ) {
+                return;
+            }
+
+
+            // =========================
+            // RANG 0 IGNORIEREN
+            // =========================
+
+            if (
+                senderRank < 1
+            ) {
+                return;
+            }
+
+
+            // =========================
+            // PREFIX
+            // =========================
+
+            const globalPrefix =
+                loadPrefix();
+
+            const groupPrefixes =
+                loadGroupPrefixes();
+
+
+            const PREFIX =
+                isGroup &&
+                groupPrefixes[
+                    remoteJid
+                ]
+                    ? groupPrefixes[
+                        remoteJid
+                    ]
+                    : globalPrefix;
+
+
+            // =========================
+            // PREFIX PRÜFEN
+            // =========================
+
+            if (
+                !text.startsWith(
+                    PREFIX
+                )
+            ) {
+                return;
+            }
+
+
+            // =========================
+            // COMMAND PARSEN
+            // =========================
+
+            const withoutPrefix =
+                text
+                    .slice(
+                        PREFIX.length
+                    )
+                    .trim();
+
+
+            if (!withoutPrefix) {
+                return;
+            }
+
+
+            const parts =
+                withoutPrefix
+                    .split(/\s+/);
+
+
+            const commandName =
+                parts[0]
+                    .toLowerCase();
+
+
+            // =========================
+            // KILL SYSTEM
+            // =========================
+
+            const killedGroups =
+                loadKilledGroups();
+
+
+            if (
+                isGroup &&
+                killedGroups[
+                    remoteJid
+                ] === true &&
+                commandName !== 'kill'
+            ) {
+
+                return;
+            }
+
+
+            // =========================
+            // COMMAND SUCHEN
+            // =========================
+
+            const command =
+                commands[
+                    commandName
+                ];
+
+
+            if (!command) {
+
+                await react(
+                    sock,
+                    message,
+                    '❓'
+                );
+
+                return;
+            }
+
+
+            // =========================
+            // TELEFONNUMMER
+            // =========================
+
+            const phoneNumber =
+                await getPhoneNumber(
+                    sock,
+                    message,
+                    senderLid
+                );
+
+
+            // =========================
+            // COMMAND LOG
+            // =========================
+
+            console.log(
+                `📨 Command: ${PREFIX}${withoutPrefix} | Rang: ${senderRank} | LID: ${senderLid} | Nummer: ${phoneNumber}`
+            );
+
+
+            // =========================
+            // ONLYOWNER
+            // =========================
+
+            const onlyOwner =
+                loadOnlyOwner();
+
+            const onlyOwnerActive =
+                isGroup &&
+                onlyOwner[
+                    remoteJid
+                ] === true;
+
+            /*
+             * onlyowner selbst darf immer
+             * von Rang 2+ benutzt werden.
+             */
+
+            if (
+                onlyOwnerActive &&
+                command.name !== 'onlyowner' &&
+                senderRank < 2
+            ) {
+
+                await react(
+                    sock,
+                    message,
+                    '2️⃣'
+                );
+
+                return;
+            }
+
+            /*
+             * Gruppenbesitzer darf weiterhin
+             * Commands benutzen.
+             *
+             * Dafür wird nur dann Metadata
+             * geladen, wenn onlyowner aktiv ist
+             * und der User Rang 1 hat.
+             */
+
+            if (
+                onlyOwnerActive &&
+                command.name !== 'onlyowner' &&
+                senderRank < 2
+            ) {
+
+                let metadata;
+
+                try {
+
+                    metadata =
+                        await sock.groupMetadata(
+                            remoteJid
+                        );
+
+                } catch {
+
+                    return;
+                }
+
+                function normalizeOwnerId(
+                    value
+                ) {
+
+                    if (!value) {
+                        return '';
+                    }
+
+                    return String(value)
+                        .split(':')[0]
+                        .split('@')[0]
+                        .replace(/\D/g, '');
+                }
+
+                const senderId =
+                    normalizeOwnerId(
+                        senderLid
+                    );
+
+                const senderPhone =
+                    normalizeOwnerId(
+                        phoneNumber
+                    );
+
+                const ownerId =
+                    normalizeOwnerId(
+                        metadata?.owner
+                    );
+
+                const ownerPhone =
+                    normalizeOwnerId(
+                        metadata?.ownerPn
+                    );
+
+                const isOwner =
+                    (
+                        senderId &&
+                        ownerId &&
+                        senderId === ownerId
+                    ) ||
+                    (
+                        senderPhone &&
+                        ownerPhone &&
+                        senderPhone === ownerPhone
+                    );
+
+                if (!isOwner) {
+
+                    await react(
+                        sock,
+                        message,
+                        '2️⃣'
+                    );
+
+                    return;
+                }
+            }
+
+
+            // =========================
+            // WARTUNG
+            // =========================
+
+            const maintenance =
+                loadMaintenance();
+
+
+            if (
+                maintenance[
+                    command.name
+                ] === true &&
+                command.name !== 'wartung'
+            ) {
+
+                await react(
+                    sock,
+                    message,
+                    '🔧'
+                );
+
+                return;
+            }
+
+
+            // =========================
+            // COMMAND AUSFÜHREN
+            // =========================
+
+            try {
+
+                await command.execute({
+
+                    sock,
+
+                    message,
+
+                    text:
+                        withoutPrefix,
+
+                    senderRank,
+
+                    ranks,
+
+                    saveRanks,
+
+                    phoneNumber,
+
+                    react
+                });
+
+            } catch (error) {
+
+                console.error(
+                    `❌ Fehler bei Command ${command.name}:`,
+                    error
+                );
+
+
+                await react(
+                    sock,
+                    message,
+                    '❌'
+                );
+            }
+        }
+    );
+}
+
+
+// =========================
+// BOT STARTEN
+// =========================
+
+startBot();
