@@ -1,0 +1,287 @@
+const fs = require('fs');
+const path = require('path');
+
+const {
+    downloadMediaMessage
+} = require('@whiskeysockets/baileys');
+
+module.exports = {
+    name: 'look',
+
+    aliases: ['l'],
+
+    description: 'Lädt ein normales Bild/Video oder Einmalmedien herunter und schickt es privat an den Ausführer.',
+
+    usage: 'look',
+
+    execute: async ({
+        sock,
+        message,
+        senderRank,
+        react
+    }) => {
+
+        /*
+         * NUR RANG 3
+         */
+        if (senderRank < 3) {
+
+            await react(
+                sock,
+                message,
+                '3️⃣'
+            );
+
+            return;
+        }
+
+        try {
+
+            /*
+             * Prüfen, ob auf eine Nachricht
+             * geantwortet wurde.
+             */
+            const contextInfo =
+                message.message
+                    ?.extendedTextMessage
+                    ?.contextInfo;
+
+            let quotedMessage =
+                contextInfo?.quotedMessage;
+
+            if (!quotedMessage) {
+
+                await react(
+                    sock,
+                    message,
+                    '❌'
+                );
+
+                return;
+            }
+
+            /*
+             * NEU: Falls es eine Einmalansicht ist,
+             * die innere Nachricht extrahieren.
+             */
+            if (quotedMessage.viewOnceMessage) {
+                quotedMessage = quotedMessage.viewOnceMessage.message;
+            } else if (quotedMessage.viewOnceMessageV2) {
+                quotedMessage = quotedMessage.viewOnceMessageV2.message;
+            }
+
+            /*
+             * Prüfen, ob die (ggf. extrahierte) Nachricht
+             * ein Bild oder Video enthält.
+             */
+            let mediaType = null;
+
+            if (
+                quotedMessage.imageMessage
+            ) {
+
+                mediaType = 'image';
+
+            } else if (
+                quotedMessage.videoMessage
+            ) {
+
+                mediaType = 'video';
+            }
+
+            if (!mediaType) {
+
+                await react(
+                    sock,
+                    message,
+                    '❌'
+                );
+
+                return;
+            }
+
+            /*
+             * Temporären Ordner erstellen.
+             */
+            const folder =
+                path.join(
+                    __dirname,
+                    '..',
+                    'look'
+                );
+
+            if (!fs.existsSync(folder)) {
+
+                fs.mkdirSync(
+                    folder,
+                    {
+                        recursive: true
+                    }
+                );
+            }
+
+            const extension =
+                mediaType === 'video'
+                    ? 'mp4'
+                    : 'jpeg';
+
+            const filename =
+                `look_${Date.now()}.${extension}`;
+
+            const filepath =
+                path.join(
+                    folder,
+                    filename
+                );
+
+            /*
+             * Key der zitierten Nachricht erstellen.
+             */
+            const quotedMessageKey = {
+
+                remoteJid:
+                    message.key.remoteJid,
+
+                id:
+                    contextInfo.stanzaId,
+
+                participant:
+                    contextInfo.participant,
+
+                fromMe:
+                    false
+            };
+
+            const targetMessage = {
+
+                key:
+                    quotedMessageKey,
+
+                // WICHTIG: Das modifizierte quotedMessage-Objekt übergeben
+                message:
+                    quotedMessage
+            };
+
+            console.log(
+                `👀 !look: ${mediaType} wird heruntergeladen...`
+            );
+
+            /*
+             * herunterladen
+             */
+            const buffer =
+                await downloadMediaMessage(
+                    targetMessage,
+                    'buffer',
+                    {},
+                    {
+                        logger: console,
+
+                        reuploadRequest:
+                            sock.updateMediaMessage
+                    }
+                );
+
+            /*
+             * Temporär speichern
+             */
+            fs.writeFileSync(
+                filepath,
+                buffer
+            );
+
+            console.log(
+                `📁 !look: ${filename} gespeichert.`
+            );
+
+            /*
+             * Private JID des Ausführers bestimmen.
+             */
+            const senderJid =
+                message.key.participant ||
+                message.key.remoteJid;
+
+            /*
+             * Bild
+             */
+            if (mediaType === 'image') {
+
+                await sock.sendMessage(
+                    senderJid,
+                    {
+                        image: buffer,
+                        mimetype:
+                            'image/jpeg',
+                        caption:
+                            '👀 Hier ist dein Bild.'
+                    }
+                );
+
+            }
+
+            /*
+             * Video
+             */
+            if (mediaType === 'video') {
+
+                await sock.sendMessage(
+                    senderJid,
+                    {
+                        video: buffer,
+                        mimetype:
+                            'video/mp4',
+                        caption:
+                            '👀 Hier ist dein Video.'
+                    }
+                );
+            }
+
+            console.log(
+                `📨 !look: ${mediaType} privat an ${senderJid} gesendet.`
+            );
+
+            /*
+             * Temporäre Datei wieder löschen.
+             */
+            try {
+
+                fs.unlinkSync(
+                    filepath
+                );
+
+                console.log(
+                    `🗑️ !look: ${filename} gelöscht.`
+                );
+
+            } catch (deleteError) {
+
+                console.error(
+                    '⚠️ Temporäre !look-Datei konnte nicht gelöscht werden:',
+                    deleteError
+                );
+            }
+
+            /*
+             * Erfolgs-Reaction im ursprünglichen Chat.
+             */
+            await react(
+                sock,
+                message,
+                '✅'
+            );
+
+        } catch (error) {
+
+            console.error(
+                '❌ Fehler bei !look:',
+                error
+            );
+
+            await react(
+                sock,
+                message,
+                '❌'
+            );
+        }
+    }
+};
