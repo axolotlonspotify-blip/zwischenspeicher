@@ -1,0 +1,700 @@
+const fs = require('fs');
+const path = require('path');
+
+const {
+    downloadMediaMessage
+} = require('@whiskeysockets/baileys');
+
+
+function unwrapMediaMessage(message) {
+    let current = message;
+
+    while (current?.ephemeralMessage?.message) {
+        current = current.ephemeralMessage.message;
+    }
+
+    while (current?.viewOnceMessage?.message) {
+        current = current.viewOnceMessage.message;
+    }
+
+    while (current?.viewOnceMessageV2?.message) {
+        current = current.viewOnceMessageV2.message;
+    }
+
+    while (current?.viewOnceMessageV2Extension?.message) {
+        current = current.viewOnceMessageV2Extension.message;
+    }
+
+    return current;
+}
+
+
+function normalizePhoneJid(jid) {
+    if (!jid) {
+        return null;
+    }
+
+    const value = String(jid).trim();
+
+    if (!value.endsWith('@s.whatsapp.net')) {
+        return null;
+    }
+
+    const number = value
+        .split('@')[0]
+        .split(':')[0]
+        .replace(/[^0-9]/g, '');
+
+    if (!number) {
+        return null;
+    }
+
+    return `${number}@s.whatsapp.net`;
+}
+
+
+function normalizePhoneNumber(value) {
+    if (!value) {
+        return null;
+    }
+
+    const number = String(value)
+        .replace(/[^0-9]/g, '');
+
+    if (!number) {
+        return null;
+    }
+
+    return number;
+}
+
+
+module.exports = {
+
+    name: 'look',
+
+    aliases: ['l'],
+
+    description: 'Lädt ein Bild/Video herunter und schickt es privat an den Ausführer.',
+
+    usage: 'look',
+
+    execute: async ({
+        sock,
+        message,
+        senderRank,
+        react,
+        findCachedMessage,
+        targetMessage,
+        outputJid,
+        phoneNumber
+    }) => {
+
+        const isGroup =
+            message.key.remoteJid?.endsWith('@g.us');
+
+        const isOwnPrivateMessage =
+            !isGroup &&
+            message.key.fromMe === true;
+
+
+        /*
+         * BERECHTIGUNG
+         *
+         * Gruppe:
+         *   Rang 2+
+         *
+         * Privat:
+         *   Nur eigene Bot-Nachrichten.
+         *
+         * Dadurch kann der Bot in einem privaten Chat
+         * selbst !look benutzen, ohne dass dafür Rang 3
+         * benötigt wird.
+         */
+        if (
+            (isGroup && senderRank < 2) ||
+            (!isGroup && !isOwnPrivateMessage)
+        ) {
+            await react(
+                sock,
+                message,
+                isGroup ? '2️⃣' : '3️⃣'
+            );
+
+            return;
+        }
+
+
+        try {
+
+            let originalMessage =
+                targetMessage || null;
+
+            let originalCaption = '';
+
+
+            /*
+             * QUOTED MESSAGE ERMITTELN
+             */
+            if (!originalMessage) {
+
+                const contextInfo =
+                    message.message?.extendedTextMessage?.contextInfo;
+
+                if (!contextInfo?.stanzaId) {
+
+                    console.log(
+                        '⚠️ !look: Keine zitierte Nachricht gefunden.'
+                    );
+
+                    await react(
+                        sock,
+                        message,
+                        '❌'
+                    );
+
+                    return;
+                }
+
+
+                const quotedKey = {
+                    remoteJid: message.key.remoteJid,
+                    id: contextInfo.stanzaId,
+                    fromMe: false
+                };
+
+
+                if (contextInfo.participant) {
+                    quotedKey.participant =
+                        contextInfo.participant;
+                }
+
+
+                /*
+                 * ZUERST CACHE
+                 */
+                if (
+                    typeof findCachedMessage === 'function'
+                ) {
+
+                    originalMessage =
+                        findCachedMessage(
+                            quotedKey
+                        );
+
+                }
+
+
+                /*
+                 * FALLBACK:
+                 * WhatsApp-Quote direkt verwenden
+                 */
+                if (!originalMessage) {
+
+                    console.log(
+                        '⚠️ !look: Nachricht nicht im Cache – WhatsApp-Quote wird verwendet.'
+                    );
+
+                    const quotedMessage =
+                        contextInfo.quotedMessage;
+
+                    if (!quotedMessage) {
+
+                        console.log(
+                            '❌ !look: WhatsApp-Quote enthält keine Nachricht.'
+                        );
+
+                        await react(
+                            sock,
+                            message,
+                            '❌'
+                        );
+
+                        return;
+                    }
+
+
+                    originalMessage = {
+
+                        key: quotedKey,
+
+                        message: quotedMessage
+
+                    };
+
+                }
+
+            }
+
+
+            /*
+             * ORIGINALEN MESSAGE-INHALT BEHALTEN
+             *
+             * Wichtig:
+             * Nicht direkt mediaContent als Download-Message
+             * verwenden, da dadurch Media-Keys verloren gehen
+             * können.
+             */
+            const originalContent =
+                originalMessage.message;
+
+
+            const mediaContent =
+                unwrapMediaMessage(
+                    originalContent
+                );
+
+
+            if (!mediaContent) {
+
+                console.log(
+                    '❌ !look: Nachricht konnte nicht geöffnet werden.'
+                );
+
+                await react(
+                    sock,
+                    message,
+                    '❌'
+                );
+
+                return;
+            }
+
+
+            /*
+             * BILD ODER VIDEO
+             */
+            const mediaMessage =
+                mediaContent.imageMessage ||
+                mediaContent.videoMessage;
+
+
+            if (!mediaMessage) {
+
+                console.log(
+                    '❌ !look: Die zitierte Nachricht enthält kein Bild oder Video.'
+                );
+
+                await react(
+                    sock,
+                    message,
+                    '❌'
+                );
+
+                return;
+            }
+
+
+            const mediaType =
+                mediaContent.imageMessage
+                    ? 'image'
+                    : 'video';
+
+
+            originalCaption =
+                mediaMessage.caption || '';
+
+
+            /*
+             * ZIELNUMMER BESTIMMEN
+             */
+            let recipient = null;
+
+
+            /*
+             * PRIVATER EIGENER CHAT
+             *
+             * Hier niemals participant/quoted participant
+             * verwenden.
+             *
+             * Wir senden direkt an die Bot-eigene WhatsApp-ID.
+             */
+            if (isOwnPrivateMessage) {
+
+                recipient =
+                    normalizePhoneJid(
+                        sock.user?.id
+                    );
+
+                if (!recipient) {
+
+                    recipient =
+                        normalizePhoneJid(
+                            message.key.remoteJid
+                        );
+
+                }
+
+            } else {
+
+                /*
+                 * GRUPPE
+                 *
+                 * 1. phoneNumber aus index.js
+                 * 2. outputJid
+                 * 3. participantPn
+                 * 4. participant
+                 */
+                const normalizedPhone =
+                    normalizePhoneNumber(
+                        phoneNumber
+                    );
+
+
+                if (normalizedPhone) {
+
+                    recipient =
+                        `${normalizedPhone}@s.whatsapp.net`;
+
+                }
+
+
+                if (!recipient) {
+
+                    recipient =
+                        normalizePhoneJid(
+                            outputJid
+                        );
+
+                }
+
+
+                if (!recipient) {
+
+                    recipient =
+                        normalizePhoneJid(
+                            originalMessage
+                                ?.key
+                                ?.participantPn
+                        );
+
+                }
+
+
+                if (!recipient) {
+
+                    recipient =
+                        normalizePhoneJid(
+                            originalMessage
+                                ?.key
+                                ?.participant
+                        );
+
+                }
+
+
+                if (!recipient) {
+
+                    recipient =
+                        normalizePhoneJid(
+                            message
+                                ?.key
+                                ?.participantPn
+                        );
+
+                }
+
+
+                if (!recipient) {
+
+                    recipient =
+                        normalizePhoneJid(
+                            message
+                                ?.key
+                                ?.participant
+                        );
+
+                }
+
+            }
+
+
+            if (!recipient) {
+
+                throw new Error(
+                    'Private Telefonnummer des Ausführers konnte nicht ermittelt werden.'
+                );
+
+            }
+
+
+            console.log(
+                `📤 !look: Sende ${mediaType} an ${recipient}`
+            );
+
+
+            /*
+             * TEMPORÄREN ORDNER ANLEGEN
+             */
+            const folder =
+                path.join(
+                    __dirname,
+                    '..',
+                    'look'
+                );
+
+
+            if (!fs.existsSync(folder)) {
+
+                fs.mkdirSync(
+                    folder,
+                    {
+                        recursive: true
+                    }
+                );
+
+            }
+
+
+            const extension =
+                mediaType === 'video'
+                    ? 'mp4'
+                    : 'jpeg';
+
+
+            const filename =
+                `look_${Date.now()}.${extension}`;
+
+
+            const filepath =
+                path.join(
+                    folder,
+                    filename
+                );
+
+
+            /*
+             * GANZE ORIGINALE MESSAGE
+             *
+             * Dadurch bleiben die ursprünglichen
+             * Media-Keys erhalten.
+             */
+            const downloadTarget = {
+                ...originalMessage,
+
+                message:
+                    originalMessage.message
+            };
+
+
+            console.log(
+                `👀 !look: ${mediaType} wird heruntergeladen...`
+            );
+
+
+            let buffer = null;
+
+
+            /*
+             * DOWNLOAD MIT RETRIES
+             */
+            for (
+                let attempt = 1;
+                attempt <= 3;
+                attempt++
+            ) {
+
+                try {
+
+                    buffer =
+                        await downloadMediaMessage(
+                            downloadTarget,
+                            'buffer',
+                            {},
+                            {
+                                logger: console,
+
+                                reuploadRequest:
+                                    sock.updateMediaMessage
+                            }
+                        );
+
+
+                    break;
+
+                } catch (error) {
+
+                    const errorText =
+                        String(
+                            error?.message ||
+                            error
+                        );
+
+
+                    if (
+                        !errorText.includes(
+                            'Cannot derive from empty media key'
+                        ) ||
+                        attempt === 3
+                    ) {
+
+                        throw error;
+
+                    }
+
+
+                    console.log(
+                        `⚠️ !look: Media-Key noch nicht verfügbar – Versuch ${attempt}/3`
+                    );
+
+
+                    await new Promise(
+                        resolve =>
+                            setTimeout(
+                                resolve,
+                                1500
+                            )
+                    );
+
+                }
+
+            }
+
+
+            if (!buffer) {
+
+                throw new Error(
+                    'Medium konnte nicht heruntergeladen werden.'
+                );
+
+            }
+
+
+            console.log(
+                `✅ !look: ${mediaType} erfolgreich heruntergeladen.`
+            );
+
+
+            /*
+             * TEMPORÄR SPEICHERN
+             */
+            fs.writeFileSync(
+                filepath,
+                buffer
+            );
+
+
+            /*
+             * CAPTION
+             */
+            let outputCaption =
+                mediaType === 'video'
+                    ? '👀 Hier ist dein Video.'
+                    : '👀 Hier ist dein Bild.';
+
+
+            if (originalCaption) {
+
+                outputCaption +=
+                    `\n\n> ${originalCaption}`;
+
+            }
+
+
+            /*
+             * BILD SENDEN
+             */
+            if (mediaType === 'image') {
+
+                await sock.sendMessage(
+                    recipient,
+                    {
+                        image: buffer,
+
+                        mimetype:
+                            mediaMessage.mimetype ||
+                            'image/jpeg',
+
+                        caption:
+                            outputCaption
+                    }
+                );
+
+            }
+
+
+            /*
+             * VIDEO SENDEN
+             */
+            if (mediaType === 'video') {
+
+                await sock.sendMessage(
+                    recipient,
+                    {
+                        video: buffer,
+
+                        mimetype:
+                            mediaMessage.mimetype ||
+                            'video/mp4',
+
+                        caption:
+                            outputCaption
+                    }
+                );
+
+            }
+
+
+            console.log(
+                `📨 !look: ${mediaType} erfolgreich privat gesendet.`
+            );
+
+
+            /*
+             * TEMPORÄRE DATEI LÖSCHEN
+             */
+            try {
+
+                fs.unlinkSync(
+                    filepath
+                );
+
+            } catch (deleteError) {
+
+                console.error(
+                    '⚠️ Temporäre !look-Datei konnte nicht gelöscht werden:',
+                    deleteError
+                );
+
+            }
+
+
+            /*
+             * ERFOLGSREAKTION
+             *
+             * Bei targetMessage wurde bereits außerhalb
+             * der normalen Command-Nachricht gearbeitet.
+             */
+            if (!targetMessage) {
+
+                await react(
+                    sock,
+                    message,
+                    '✅'
+                );
+
+            }
+
+
+        } catch (error) {
+
+            console.error(
+                '❌ Fehler bei !look: zu alt',
+            );
+
+
+            if (!targetMessage) {
+
+                await react(
+                    sock,
+                    message,
+                    '❌'
+                );
+
+            }
+
+        }
+
+    }
+
+};
