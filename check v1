@@ -1,0 +1,226 @@
+module.exports = {
+    name: 'check',
+
+    aliases: [],
+
+    description: 'Zeigt Informationen über eine Person. ',
+
+    usage: 'check @Person',
+
+    execute: async ({
+        sock,
+        message,
+        text,
+        senderRank,
+        ranks,
+        react
+    }) => {
+
+        if (senderRank < 1) {
+            return;
+        }
+
+        if (senderRank < 1) {
+            await react(
+                sock,
+                message,
+                '3️⃣'
+            );
+            return;
+        }
+
+        const groupJid =
+            message.key.remoteJid;
+
+        if (!groupJid?.endsWith('@g.us')) {
+            await react(
+                sock,
+                message,
+                '❌'
+            );
+            return;
+        }
+
+        const contextInfo =
+            message.message
+                ?.extendedTextMessage
+                ?.contextInfo;
+
+        const mentionedJids =
+            contextInfo?.mentionedJid || [];
+
+        let targetJid =
+            mentionedJids[0];
+
+        if (!targetJid) {
+            targetJid =
+                contextInfo?.participant;
+        }
+
+        if (!targetJid) {
+            await react(
+                sock,
+                message,
+                '❌'
+            );
+            return;
+        }
+
+        /*
+         * ============================
+         * LID
+         * ============================
+         */
+
+        const targetLid =
+            targetJid
+                .split(':')[0]
+                .split('@')[0] +
+            '@lid';
+
+        /*
+         * ============================
+         * BOT-RANG
+         * ============================
+         */
+
+        const targetRank =
+            Number(
+                ranks[targetLid] ??
+                ranks[targetJid] ??
+                0
+            );
+
+        const botRankText =
+            targetRank === 1 ||
+            targetRank === 2 ||
+            targetRank === 3
+                ? String(targetRank)
+                : 'none';
+
+        /*
+         * ============================
+         * TELEFONNUMMER
+         * ============================
+         */
+
+        let phoneNumber = null;
+
+        try {
+            if (
+                targetLid.endsWith('@lid') &&
+                sock.signalRepository?.lidMapping
+            ) {
+                const pn =
+                    await sock.signalRepository
+                        .lidMapping
+                        .getPNForLID(targetLid);
+
+                if (pn) {
+                    phoneNumber =
+                        pn
+                            .split(':')[0]
+                            .split('@')[0];
+                }
+            }
+        } catch (error) {
+            console.error(
+                '❌ Fehler beim Ermitteln der Telefonnummer:',
+                error
+            );
+        }
+
+        /*
+         * ============================
+         * ADMIN
+         * ============================
+         */
+
+        const metadata =
+            await sock.groupMetadata(
+                groupJid
+            );
+
+        const targetParticipant =
+            metadata.participants.find(
+                participant =>
+                    participant.id === targetJid ||
+                    participant.lid === targetJid
+            );
+
+        const isAdmin =
+            targetParticipant?.admin === 'admin' ||
+            targetParticipant?.admin === 'superadmin';
+
+        /*
+         * ============================
+         * GEMEINSAME GRUPPEN
+         * ============================
+         *
+         * WICHTIG:
+         * Hier benutzen wir absichtlich
+         * NUR participant.id === targetJid.
+         *
+         * Keine LID-Fallbacks.
+         * Keine Telefonnummer.
+         * Keine phoneNumber.
+         */
+
+        let commonGroups = 0;
+
+        try {
+            const participatingGroups =
+                await sock.groupFetchAllParticipating();
+
+            for (
+                const group of Object.values(
+                    participatingGroups
+                )
+            ) {
+
+                const isMember =
+                    group.participants.some(
+                        participant =>
+                            participant.id === targetJid
+                    );
+
+                if (isMember) {
+                    commonGroups++;
+                }
+            }
+
+        } catch (error) {
+            console.error(
+                '❌ Fehler beim Ermitteln der gemeinsamen Gruppen:',
+                error
+            );
+        }
+
+        /*
+         * ============================
+         * AUSGABE
+         * ============================
+         */
+
+        const result =
+            `🔎 *Check*\n\n` +
+            `> 🪪 LID: ${targetLid}\n` +
+            `> 🏅 Bot-Rang: ${botRankText}\n` +
+            `> 📱 Telefonnummer: ${phoneNumber || 'unbekannt'}\n` +
+            `> 👑 Admin: ${isAdmin ? 'Ja' : 'Nein'}\n` +
+            `> 👥 Gemeinsame Gruppen: ${commonGroups}`;
+
+        await sock.sendMessage(
+            groupJid,
+            {
+                text: result
+            }
+        );
+
+        await react(
+            sock,
+            message,
+            '✅'
+        );
+    }
+};
